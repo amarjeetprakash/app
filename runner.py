@@ -1511,6 +1511,16 @@ async def run_user_bot(config):
                                 user_state["current_cycle_fail"] += 1
                                 continue
 
+                            # 🔄 Refresh Saved Messages list so smart keyword matching reflects newly edited text
+                            try:
+                                fresh_saved = await client.get_messages("me", limit=100)
+                                fresh_valid = [m for m in fresh_saved if m.text or m.media]
+                                if fresh_valid:
+                                    fresh_valid.reverse()
+                                    valid_messages = fresh_valid
+                            except Exception:
+                                pass
+
                             # 🎯 Smart Ad Sender: Select message matching group topic tags, or fall back to default flow
                             send_msg = msg
                             if user_state.get("smart_ad_mode", True):
@@ -1518,6 +1528,17 @@ async def run_user_bot(config):
                                 if matched_msg:
                                     send_msg = matched_msg
                                     log_event(f"🎯 Smart Ad Tag Match for {group}")
+
+                            # 🔄 Live Saved Message Fetch: Ensure edited/updated ads are fetched directly from Telegram
+                            try:
+                                live_msg = await client.get_messages("me", ids=send_msg.id)
+                                if live_msg and (live_msg.text or live_msg.media):
+                                    send_msg = live_msg
+                                else:
+                                    log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or empty. Skipping group.")
+                                    continue
+                            except Exception as live_err:
+                                log_event(f"Warning: Could not fetch live message #{send_msg.id} ({live_err}). Using cached version.")
 
                             if user_state["use_copy"]:
                                 # 🌈 Copy Mode (with sequential message_id tag & entity formatting)
