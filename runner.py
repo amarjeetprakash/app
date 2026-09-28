@@ -664,8 +664,10 @@ async def resolve_group_entity(client, group_url: Any, config: dict = None, phon
     # Return original group_url string (do NOT cache string failure)
     return group_url
 
-async def interruptible_sleep(get_target_time, tz_name: str):
+async def interruptible_sleep(get_target_time, tz_name: str, wake_event: Optional[Any] = None):
     while True:
+        if wake_event and wake_event.is_set():
+            break
         target = get_target_time()
         if not target:
             break
@@ -675,8 +677,15 @@ async def interruptible_sleep(get_target_time, tz_name: str):
         rem = (target - now).total_seconds()
         if rem <= 0:
             break
-        # Sleep at most 1 second to remain highly responsive
-        await asyncio.sleep(min(rem, 1.0))
+        sleep_chunk = min(rem, 0.5)
+        if wake_event:
+            try:
+                await asyncio.wait_for(wake_event.wait(), timeout=sleep_chunk)
+                break
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(sleep_chunk)
 
 # Global Auto-Night config (shared across accounts)
 AUTONIGHT_CFG = _load_autonight()
@@ -716,6 +725,8 @@ async def run_user_bot(config):
         "logs": [],
         "errors": loaded_errors,
         "msg_seq": 0,
+        "ads_updated": False,
+        "wake_event": asyncio.Event(),
         "start_time": _get_now_tz(reload_autonight_cfg().get("tz", DEFAULT_AUTONIGHT["tz"]))
     }
 
@@ -844,6 +855,64 @@ async def run_user_bot(config):
                 logger.error(f"Error in command handler: {e}", exc_info=True)
                 log_event(f"Command Error: {type(e).__name__} - {e}", details=tb_str)
         return wrapper
+
+    @client.on(events.NewMessage(outgoing=True))
+    async def out_ad_handler(event):
+        if not event.message:
+            return
+        text = (event.raw_text or "").strip()
+        if text.startswith("."):
+            return
+        chat = await event.get_chat()
+        is_saved = getattr(chat, 'is_self', False)
+        if not is_saved:
+            try:
+                me_user = await client.get_me()
+                is_saved = (event.chat_id == me_user.id)
+            except Exception:
+                pass
+        if is_saved:
+            log_event("📢 New ad message detected in Saved Messages! Reloading ads real-time...")
+            user_state["ads_updated"] = True
+            user_state["wake_event"].set()
+
+    @client.on(events.MessageDeleted())
+    async def deleted_ad_handler(event):
+        chat_id = getattr(event, 'chat_id', None)
+        is_saved = False
+        if chat_id is not None:
+            try:
+                me_user = await client.get_me()
+                if chat_id == me_user.id:
+                    is_saved = True
+            except Exception:
+                pass
+        else:
+            is_saved = True
+        if is_saved:
+            log_event("🗑️ Ad deletion detected in Saved Messages! Reloading ads real-time...")
+            user_state["ads_updated"] = True
+            user_state["wake_event"].set()
+
+    @client.on(events.MessageEdited(outgoing=True))
+    async def edited_ad_handler(event):
+        if not event.message:
+            return
+        text = (event.raw_text or "").strip()
+        if text.startswith("."):
+            return
+        chat = await event.get_chat()
+        is_saved = getattr(chat, 'is_self', False)
+        if not is_saved:
+            try:
+                me_user = await client.get_me()
+                is_saved = (event.chat_id == me_user.id)
+            except Exception:
+                pass
+        if is_saved:
+            log_event("✏️ Ad edit detected in Saved Messages! Reloading ads real-time...")
+            user_state["ads_updated"] = True
+            user_state["wake_event"].set()
 
     @client.on(events.NewMessage)
     @command_wrapper
@@ -1456,8 +1525,10 @@ async def run_user_bot(config):
     async def forward_loop():
         while True:
             tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+            user_state["ads_updated"] = False
+            user_state["wake_event"].clear()
+            ad_reload_needed = False
             try:
-                
                 # 🎯 Check if target groups are configured first
                 groups_list = _get_config_groups(config)
                 if not groups_list:
@@ -1465,7 +1536,7 @@ async def run_user_bot(config):
                     user_state["status"] = "Idle (No Groups) 😴"
                     now = _get_now_tz(tz)
                     user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
-                    await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                    await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
                     continue
 
                 # 💎 Fetch all messages from Saved Messages (up to 100)
@@ -1481,11 +1552,18 @@ async def run_user_bot(config):
                     user_state["status"] = "Idle (No Msg) 😴"
                     now = _get_now_tz(tz)
                     user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
-                    await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                    await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
                     continue
 
                 # Forward messages one by one
                 for msg_idx, msg in enumerate(valid_messages, 1):
+                    if user_state.get("ads_updated", False) or ad_reload_needed:
+                        log_event("📢 Ad update detected! Aborting queue to reload fresh ads immediately...")
+                        user_state["ads_updated"] = False
+                        user_state["wake_event"].clear()
+                        ad_reload_needed = True
+                        break
+
                     log_event(f"Processing message {msg_idx}/{len(valid_messages)}")
                     interrupted_by_night = False
                     
@@ -1494,6 +1572,13 @@ async def run_user_bot(config):
 
                     groups_list = _get_config_groups(config)
                     for i, group in enumerate(groups_list, 1):
+                        if user_state.get("ads_updated", False) or ad_reload_needed:
+                            log_event("📢 Ad update detected mid-group loop! Aborting to reload fresh ads immediately...")
+                            user_state["ads_updated"] = False
+                            user_state["wake_event"].clear()
+                            ad_reload_needed = True
+                            break
+
                         # If night starts mid-cycle, break early
                         if autonight_is_quiet(AUTONIGHT_CFG):
                             interrupted_by_night = True
@@ -1529,16 +1614,19 @@ async def run_user_bot(config):
                                     send_msg = matched_msg
                                     log_event(f"🎯 Smart Ad Tag Match for {group}")
 
-                            # 🔄 Live Saved Message Fetch: Ensure edited/updated ads are fetched directly from Telegram
+                            # 🔄 Live Saved Message Fetch: Ensure message still exists in Saved Messages & fetch updated text
                             try:
                                 live_msg = await client.get_messages("me", ids=send_msg.id)
-                                if live_msg and (live_msg.text or live_msg.media):
+                                if isinstance(live_msg, list):
+                                    live_msg = live_msg[0] if live_msg else None
+                                if live_msg and not getattr(live_msg, 'empty', False) and (live_msg.text or live_msg.media):
                                     send_msg = live_msg
                                 else:
-                                    log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or empty. Skipping group.")
+                                    log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or empty. Skipping deleted ad.")
                                     continue
                             except Exception as live_err:
-                                log_event(f"Warning: Could not fetch live message #{send_msg.id} ({live_err}). Using cached version.")
+                                log_event(f"⚠️ Saved Message #{send_msg.id} is deleted/invalid ({live_err}). Skipping deleted ad.")
+                                continue
 
                             if user_state["use_copy"]:
                                 # 🌈 Copy Mode (with sequential message_id tag & entity formatting)
@@ -1587,7 +1675,7 @@ async def run_user_bot(config):
                              db.update_user_config(phone, msg_delay_sec=user_state["delay"])
                              now = _get_now_tz(tz)
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 10)
-                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
                              custom_sleep_done = True
                         except PeerFloodError as e:
                              log_event("⚠️ Telegram PeerFlood limit! Cool-down mode activated. Pausing 20m & increasing delay.")
@@ -1597,14 +1685,14 @@ async def run_user_bot(config):
                              db.update_user_config(phone, msg_delay_sec=user_state["delay"])
                              now = _get_now_tz(tz)
                              user_state["next_msg_at"] = now + timedelta(minutes=20)
-                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
                              custom_sleep_done = True
                         except SlowModeWaitError as e:
                              log_event(f"Slowmode in {group}. Waiting {e.seconds}s")
                              user_state["status"] = f"Slowmode ⏳ ({e.seconds}s)"
                              now = _get_now_tz(tz)
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 2)
-                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                             await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
                              custom_sleep_done = True
                         except Exception as e:
                              import traceback
@@ -1615,23 +1703,29 @@ async def run_user_bot(config):
 
                         # Always sleep the delay between groups (unless custom sleep occurred or it is the last group)
                         if i < len(groups_list) and not custom_sleep_done:
-                            # 🌙 Check if late night slow mode (00:00 -> 07:00 / after 12 AM)
                             if autonight_is_slow_mode(AUTONIGHT_CFG):
                                 eff_delay = max(user_state["delay"], 60.0) # 60s-75s slow delay overnight
                             else:
                                 eff_delay = max(user_state["delay"], 35.0) # 35s-45s safe delay daytime
 
-                            # 🛡️ Organic Human Jitter (85% - 125%) to evade Telegram automated bot detection patterns
                             wait_time = eff_delay * random.uniform(0.85, 1.25)
-                            # Subtract the message-sending duration to avoid latency drift accumulation
                             elapsed = (_get_now_tz(tz) - send_start).total_seconds()
                             remaining_wait = max(0.5, wait_time - elapsed)
                             
                             now = _get_now_tz(tz)
                             user_state["next_msg_at"] = now + timedelta(seconds=remaining_wait)
-                            await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                            await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
+                            if user_state.get("ads_updated", False):
+                                log_event("📢 Ad update detected during inter-group sleep! Aborting cycle...")
+                                user_state["ads_updated"] = False
+                                user_state["wake_event"].clear()
+                                ad_reload_needed = True
+                                break
                         elif i == len(groups_list):
                             user_state["next_msg_at"] = None
+
+                    if ad_reload_needed:
+                        break
 
                     # 🛡️ Adaptive Safety Backoff: If cycle had errors, increase delay by +5s to protect account
                     if user_state["current_cycle_fail"] > 0:
@@ -1656,7 +1750,19 @@ async def run_user_bot(config):
                             sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
                         now = _get_now_tz(tz)
                         user_state["next_msg_at"] = now + timedelta(seconds=sleep_seconds)
-                        await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                        await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
+                        if user_state.get("ads_updated", False):
+                            log_event("📢 Ad update detected during inter-msg sleep! Reloading ads...")
+                            user_state["ads_updated"] = False
+                            user_state["wake_event"].clear()
+                            ad_reload_needed = True
+                            break
+
+                if ad_reload_needed or user_state.get("ads_updated", False):
+                    user_state["ads_updated"] = False
+                    user_state["wake_event"].clear()
+                    log_event("🔄 Reloading updated ads real-time without delay...")
+                    continue
 
                 # After all messages are processed, wait the cycle delay again before checking for new messages
                 if autonight_is_slow_mode(AUTONIGHT_CFG):
@@ -1667,7 +1773,12 @@ async def run_user_bot(config):
                     sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
                 now = _get_now_tz(tz)
                 user_state["next_msg_at"] = now + timedelta(seconds=sleep_seconds)
-                await interruptible_sleep(lambda: user_state["next_msg_at"], tz)
+                await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
+                if user_state.get("ads_updated", False):
+                    user_state["ads_updated"] = False
+                    user_state["wake_event"].clear()
+                    log_event("🔄 Reloading updated ads real-time after sleep interrupt...")
+                    continue
 
             except Exception as e:
                 import traceback
