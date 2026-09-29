@@ -105,6 +105,61 @@ def generate_random_same_number_id() -> str:
     length = random.randint(1, 4)
     return digit * length
 
+SMALL_CAPS_MAP = {
+    'a': 'ᴀ', 'b': 'ʙ', 'c': 'ᴄ', 'd': 'ᴅ', 'e': 'ᴇ', 'f': 'ғ', 'g': 'ɢ',
+    'h': 'ʜ', 'i': 'ɪ', 'j': 'ᴊ', 'k': 'ᴋ', 'l': 'ʟ', 'm': 'ᴍ', 'n': 'ɴ',
+    'o': 'ᴏ', 'p': 'ᴘ', 'q': 'ǫ', 'r': 'ʀ', 's': 's', 't': 'ᴛ', 'u': 'ᴜ',
+    'v': 'ᴠ', 'w': 'ᴡ', 'x': 'x', 'y': 'ʏ', 'z': 'ᴢ'
+}
+
+def transform_word_to_small_caps(word: str) -> str:
+    """Converts a word to Small Caps with the first letter in standard Uppercase."""
+    if not word:
+        return word
+    if word.startswith(('http://', 'https://', 't.me/', 'www.', '@')) or word.isdigit():
+        return word
+        
+    first_char = word[0].upper()
+    rest = ''.join(SMALL_CAPS_MAP.get(c.lower(), c) for c in word[1:])
+    return first_char + rest
+
+def convert_to_small_caps_styled(text: str) -> str:
+    """
+    Transforms text into Small Caps style with first letter capitalized,
+    preserving URLs, usernames, hashtags, emojis, and newlines.
+    """
+    if not text:
+        return text
+        
+    lines = text.split('\n')
+    transformed_lines = []
+    
+    for line in lines:
+        if not line.strip():
+            transformed_lines.append(line)
+            continue
+            
+        tokens = re.split(r'(\s+)', line)
+        new_tokens = []
+        for tok in tokens:
+            if tok.isspace():
+                new_tokens.append(tok)
+            elif tok.startswith(('http://', 'https://', 't.me/', 'www.', '@')):
+                new_tokens.append(tok)
+            else:
+                sub_parts = re.split(r'([a-zA-Z]+)', tok)
+                new_sub = []
+                for sub in sub_parts:
+                    if sub.isalpha():
+                        new_sub.append(transform_word_to_small_caps(sub))
+                    else:
+                        new_sub.append(sub)
+                new_tokens.append(''.join(new_sub))
+                
+        transformed_lines.append(''.join(new_tokens))
+        
+    return '\n'.join(transformed_lines)
+
 def get_telethon_proxy(proxy_cfg: Optional[dict]):
     """
     Constructs Telethon-compatible proxy configuration tuple.
@@ -1964,14 +2019,15 @@ async def run_user_bot(config):
                             send_msg = next((m for m in fresh_valid if m.id == send_msg.id), send_msg)
 
                             if user_state["use_copy"]:
-                                # 🌈 Copy Mode: Append sequence tag with random same digit (1, 11, 111, 1111, 77, 8888) at bottom
+                                # 🌈 Copy Mode: Small Caps font styling (first letter capital) + text emoji (➤ Iᴅ - 1111)
                                 user_state["msg_seq"] += 1
                                 base_text = (send_msg.text or "").strip()
+                                styled_text = convert_to_small_caps_styled(base_text)
                                 seq_id = generate_random_same_number_id()
-                                if base_text:
-                                    caption = f"{base_text}\n\nId - {seq_id}"
+                                if styled_text:
+                                    caption = f"{styled_text}\n\n➤ Iᴅ - {seq_id}"
                                 else:
-                                    caption = f"Id - {seq_id}"
+                                    caption = f"➤ Iᴅ - {seq_id}"
 
                                 from telethon.tl.types import MessageMediaWebPage
                                 has_media = send_msg.media and not isinstance(send_msg.media, MessageMediaWebPage)
