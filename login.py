@@ -463,6 +463,74 @@ def configure_admin_id():
     else:
         print(Fore.RED + "  [!] User ID must be numeric.")
 
+def view_account_analytics(users: Dict[str, Any]):
+    if not users:
+        print(Fore.YELLOW + "  [!] No users registered yet.")
+        return
+    print(Fore.CYAN + "\n  [ ACCOUNT GROUP PERFORMANCE ANALYTICS ]")
+    user_list = list(users.items())
+    for i, (phone, data) in enumerate(user_list, 1):
+        print(f"  {i}. {data.get('name')} ({phone})")
+    choice = input("\n  Select account number (or 0 to cancel): ").strip()
+    if not choice.isdigit() or int(choice) < 1 or int(choice) > len(user_list):
+        return
+    phone, udata = user_list[int(choice) - 1]
+    stats = db.get_group_analytics(phone)
+    print(Fore.CYAN + f"\n  📊 Performance Analytics for {udata.get('name')} ({phone}):")
+    print(Fore.CYAN + "  " + "─" * 60)
+    if not stats:
+        print(Fore.YELLOW + "  [!] No analytics recorded for this account yet.")
+    else:
+        for idx, s in enumerate(stats[:25], 1):
+            tot = s["success_count"] + s["fail_count"]
+            rate = (s["success_count"] / tot * 100) if tot > 0 else 0
+            print(f"  {idx:<2}. {s['group_url']:<35} | {Fore.GREEN}✔ {s['success_count']:<3} {Fore.RED}✖ {s['fail_count']:<3} {Fore.WHITE}| {rate:>5.1f}% | {s['last_status']}")
+    print(Fore.CYAN + "  " + "─" * 60)
+    input(Fore.WHITE + "\n  Press Enter to return...")
+
+def manage_blacklist(users: Dict[str, Any]):
+    if not users:
+        print(Fore.YELLOW + "  [!] No users registered yet.")
+        return
+    print(Fore.CYAN + "\n  [ GROUP BLACKLIST / QUARANTINE MANAGER ]")
+    user_list = list(users.items())
+    for i, (phone, data) in enumerate(user_list, 1):
+        print(f"  {i}. {data.get('name')} ({phone})")
+    choice = input("\n  Select account number (or 0 to cancel): ").strip()
+    if not choice.isdigit() or int(choice) < 1 or int(choice) > len(user_list):
+        return
+    phone, udata = user_list[int(choice) - 1]
+    cfg = db.get_user_config(phone) or {}
+    blk = cfg.get("blacklist", [])
+    print(Fore.CYAN + f"\n  🛡️ Quarantined Groups for {udata.get('name')} ({phone}): {len(blk)}")
+    for idx, b in enumerate(blk, 1):
+        print(f"  {idx}. {b}")
+    print(Fore.WHITE + "\n  Options: [1] Clear Blacklist  [2] Return to Menu")
+    opt = input("  Select option: ").strip()
+    if opt == "1":
+        db.update_user_config(phone, blacklist=[])
+        print(Fore.GREEN + "  [✔] Blacklist cleared successfully.")
+
+def toggle_pause(users: Dict[str, Any]):
+    if not users:
+        print(Fore.YELLOW + "  [!] No users registered yet.")
+        return
+    print(Fore.CYAN + "\n  [ PAUSE / RESUME ENGINE TOGGLE ]")
+    user_list = list(users.items())
+    for i, (phone, data) in enumerate(user_list, 1):
+        cfg = db.get_user_config(phone) or {}
+        p_status = f"{Fore.RED}Paused ⏸️" if cfg.get("is_paused") else f"{Fore.GREEN}Active ▶️"
+        print(f"  {i}. {data.get('name')} ({phone}) - Status: {p_status}")
+    choice = input("\n  Select account number (or 0 to cancel): ").strip()
+    if not choice.isdigit() or int(choice) < 1 or int(choice) > len(user_list):
+        return
+    phone, udata = user_list[int(choice) - 1]
+    cfg = db.get_user_config(phone) or {}
+    new_state = not cfg.get("is_paused", False)
+    db.update_user_config(phone, is_paused=new_state)
+    state_str = "PAUSED ⏸️" if new_state else "RESUMED ▶️"
+    print(Fore.GREEN + f"  [✔] Account engine for {phone} is now {state_str}.")
+
 # ---------- Main Menu ----------
 def start():
     ensure_dirs()
@@ -494,9 +562,13 @@ def start():
         print(f"  {Fore.CYAN}7.{Fore.WHITE} {Fore.BLUE}Account Health Verification")
         print(f"  {Fore.CYAN}8.{Fore.WHITE} {Fore.MAGENTA}Configure Account Proxy")
         print(f"  {Fore.CYAN}9.{Fore.WHITE} Set Remote Admin Telegram ID")
-        print(f"  {Fore.CYAN}10.{Fore.WHITE} Close Manager")
+        print(f"  {Fore.CYAN}─" * 25)
+        print(f"  {Fore.CYAN}10.{Fore.WHITE} View Group Analytics")
+        print(f"  {Fore.CYAN}11.{Fore.WHITE} Manage Group Blacklist / Quarantine")
+        print(f"  {Fore.CYAN}12.{Fore.WHITE} Pause / Resume Engine")
+        print(f"  {Fore.CYAN}13.{Fore.WHITE} Close Manager")
         
-        choice = input(Fore.YELLOW + "\n  ❯ Select an option [1-10]: " + Style.RESET_ALL).strip()
+        choice = input(Fore.YELLOW + "\n  ❯ Select an option [1-13]: " + Style.RESET_ALL).strip()
 
         if choice == '1':
             list_users(users)
@@ -520,6 +592,12 @@ def start():
         elif choice == '9':
             configure_admin_id()
         elif choice == '10':
+            view_account_analytics(users)
+        elif choice == '11':
+            manage_blacklist(users)
+        elif choice == '12':
+            toggle_pause(users)
+        elif choice == '13':
             print(Fore.CYAN + "\n  Goodbye!")
             break
         else:

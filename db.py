@@ -56,13 +56,31 @@ def init_db():
             );
         """)
 
-        # Migration: Ensure proxy and group_map columns exist on users table
+        # Create analytics table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS analytics (
+                phone TEXT NOT NULL,
+                group_url TEXT NOT NULL,
+                success_count INTEGER DEFAULT 0,
+                fail_count INTEGER DEFAULT 0,
+                last_status TEXT DEFAULT 'OK',
+                last_sent_at REAL DEFAULT 0.0,
+                PRIMARY KEY(phone, group_url),
+                FOREIGN KEY(phone) REFERENCES users(phone) ON DELETE CASCADE
+            );
+        """)
+
+        # Migration: Ensure proxy, group_map, blacklist, and is_paused columns exist on users table
         cursor.execute("PRAGMA table_info(users);")
         cols = [c[1] for c in cursor.fetchall()]
         if "proxy" not in cols:
             cursor.execute("ALTER TABLE users ADD COLUMN proxy TEXT DEFAULT NULL;")
         if "group_map" not in cols:
             cursor.execute("ALTER TABLE users ADD COLUMN group_map TEXT DEFAULT '{}';")
+        if "blacklist" not in cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN blacklist TEXT DEFAULT '[]';")
+        if "is_paused" not in cols:
+            cursor.execute("ALTER TABLE users ADD COLUMN is_paused INTEGER DEFAULT 0;")
         
         conn.commit()
     finally:
@@ -294,7 +312,7 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, group_map FROM users WHERE phone = ?",
+            "SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, group_map, blacklist, is_paused FROM users WHERE phone = ?",
             (phone,)
         )
         row = cursor.fetchone()
@@ -307,6 +325,13 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
                 gmap_val = json.loads(row["group_map"])
             except Exception:
                 gmap_val = {}
+        blk_val = []
+        if "blacklist" in row.keys() and row["blacklist"]:
+            try:
+                blk_val = json.loads(row["blacklist"])
+            except Exception:
+                blk_val = []
+        is_p = bool(row["is_paused"]) if "is_paused" in row.keys() and row["is_paused"] else False
         return {
             "phone": row["phone"],
             "name": row["name"],
@@ -317,7 +342,9 @@ def get_user_config(phone: str) -> Optional[Dict[str, Any]]:
             "groups": _normalize_groups(row["groups"]),
             "plan_expiry": row["plan_expiry"],
             "proxy": proxy_val,
-            "group_map": gmap_val if isinstance(gmap_val, dict) else {}
+            "group_map": gmap_val if isinstance(gmap_val, dict) else {},
+            "blacklist": _normalize_groups(blk_val),
+            "is_paused": is_p
         }
     finally:
         conn.close()
@@ -331,10 +358,14 @@ def update_user_config(phone: str, **kwargs):
         for key, val in kwargs.items():
             if key == "groups":
                 val = json.dumps(_normalize_groups(val))
+            elif key == "blacklist":
+                val = json.dumps(_normalize_groups(val))
             elif key == "group_map":
                 val = json.dumps(val) if isinstance(val, dict) else (val or "{}")
             elif key == "proxy":
                 val = json.dumps(val) if val is not None else None
+            elif key == "is_paused":
+                val = 1 if val else 0
             elif val is None:
                 pass
             set_clauses.append(f"{key} = ?")
@@ -355,7 +386,7 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
     conn = get_db()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, group_map, updated_at FROM users")
+        cursor.execute("SELECT phone, name, api_id, api_hash, cycle_delay_min, msg_delay_sec, groups, plan_expiry, proxy, group_map, blacklist, is_paused, updated_at FROM users")
         rows = cursor.fetchall()
         res = []
         for r in rows:
@@ -365,6 +396,13 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
                     gmap_val = json.loads(r["group_map"])
                 except Exception:
                     gmap_val = {}
+            blk_val = []
+            if "blacklist" in r.keys() and r["blacklist"]:
+                try:
+                    blk_val = json.loads(r["blacklist"])
+                except Exception:
+                    blk_val = []
+            is_p = bool(r["is_paused"]) if "is_paused" in r.keys() and r["is_paused"] else False
             res.append({
                 "phone": r["phone"],
                 "name": r["name"],
@@ -376,9 +414,75 @@ def get_all_user_configs() -> List[Dict[str, Any]]:
                 "plan_expiry": r["plan_expiry"],
                 "proxy": json.loads(r["proxy"]) if r["proxy"] else None,
                 "group_map": gmap_val if isinstance(gmap_val, dict) else {},
+                "blacklist": _normalize_groups(blk_val),
+                "is_paused": is_p,
                 "updated_at": r["updated_at"]
             })
         return res
+    finally:
+        conn.close()
+
+def log_group_analytics(phone: str, group_url: str, success: bool, status_msg: str = "OK"):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        now_ts = time.time()
+        if success:
+            cursor.execute(
+                """
+                INSERT INTO analytics (phone, group_url, success_count, fail_count, last_status, last_sent_at)
+                VALUES (?, ?, 1, 0, ?, ?)
+                ON CONFLICT(phone, group_url) DO UPDATE SET
+                    success_count = success_count + 1,
+                    last_status = excluded.last_status,
+                    last_sent_at = excluded.last_sent_at
+                """,
+                (phone, group_url, status_msg, now_ts)
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO analytics (phone, group_url, success_count, fail_count, last_status, last_sent_at)
+                VALUES (?, ?, 0, 1, ?, ?)
+                ON CONFLICT(phone, group_url) DO UPDATE SET
+                    fail_count = fail_count + 1,
+                    last_status = excluded.last_status,
+                    last_sent_at = excluded.last_sent_at
+                """,
+                (phone, group_url, status_msg, now_ts)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_group_analytics(phone: str) -> List[Dict[str, Any]]:
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT group_url, success_count, fail_count, last_status, last_sent_at FROM analytics WHERE phone = ? ORDER BY (success_count + fail_count) DESC",
+            (phone,)
+        )
+        rows = cursor.fetchall()
+        return [
+            {
+                "group_url": r["group_url"],
+                "success_count": r["success_count"],
+                "fail_count": r["fail_count"],
+                "last_status": r["last_status"],
+                "last_sent_at": r["last_sent_at"]
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+def clear_analytics(phone: str):
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM analytics WHERE phone = ?", (phone,))
+        conn.commit()
     finally:
         conn.close()
 

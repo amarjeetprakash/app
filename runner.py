@@ -471,6 +471,7 @@ SYSTEM_MESSAGE_PATTERNS = [
     r"^\s*📊\s*System Statistics",
     r"^\s*📊\s*Group Health Report",
     r"^\s*📊\s*Sequence Group Selection",
+    r"^\s*📊\s*Target Group Performance",
     r"^\s*❀\s*User Info:",
     r"^\s*📋\s*Joined Target Groups",
     r"^\s*📋\s*All joined groups",
@@ -487,6 +488,8 @@ SYSTEM_MESSAGE_PATTERNS = [
     r"^\s*🛡️\s*Minimum safe",
     r"^\s*🛡️\s*Safe message delay",
     r"^\s*🛡️\s*Errors detected",
+    r"^\s*🛡️\s*Group Blacklist",
+    r"^\s*🛡️\s*Quarantined",
     r"^\s*⏳\s*Fetching unadded",
     r"^\s*⏳\s*Preparing to join",
     r"^\s*🔍\s*Auditing permissions",
@@ -505,6 +508,14 @@ SYSTEM_MESSAGE_PATTERNS = [
     r"^\s*⚠️\s*No fetched",
     r"^\s*❗\s*Usage:",
     r"^\s*❗\s*Format:",
+    r"^\s*⏸️\s*Engine Paused",
+    r"^\s*▶️\s*Engine Resumed",
+    r"^\s*🏓\s*Pong",
+    r"^\s*🎲\s*Spintax Live Generator",
+    r"^\s*📁\s*Target Groups Exported",
+    r"^\s*📥\s*Import Session Complete",
+    r"^\s*🧹\s*Target Groups Cleaned",
+    r"^\s*🧹\s*Auditing and cleaning",
 ]
 
 def is_valid_user_ad(msg: Any) -> bool:
@@ -1577,6 +1588,213 @@ async def run_user_bot(config):
                 lines.append("💡 Type `.error clear` to reset the log.")
                 await event.respond("\n".join(lines))
 
+        elif text.startswith(".pause"):
+            user_state["is_paused"] = True
+            config["is_paused"] = True
+            await asyncio.to_thread(db.update_user_config, phone, is_paused=True)
+            log_event("⏸️ Engine paused by user command.")
+            await event.respond("⏸️ **Engine Paused.** Message forwarding sequence paused until `.resume` is typed.")
+
+        elif text.startswith(".resume"):
+            user_state["is_paused"] = False
+            config["is_paused"] = False
+            await asyncio.to_thread(db.update_user_config, phone, is_paused=False)
+            user_state["wake_event"].set()
+            log_event("▶️ Engine resumed by user command.")
+            await event.respond("▶️ **Engine Resumed.** Message forwarding sequence active!")
+
+        elif text.startswith(".ping"):
+            import time as t_mod
+            start_ping = t_mod.time()
+            me = await client.get_me()
+            latency = int((t_mod.time() - start_ping) * 1000)
+            
+            tz = AUTONIGHT_CFG.get("tz", DEFAULT_AUTONIGHT["tz"])
+            now = _get_now_tz(tz)
+            uptime = str(now - user_state["start_time"]).split('.')[0]
+            p_status = "Paused ⏸️" if user_state.get("is_paused") else "Active ▶️"
+            
+            await event.respond(
+                f"🏓 **Pong!**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"⚡ **Telegram Latency:** `{latency} ms`\n"
+                f"⏱ **Uptime:** `{uptime}`\n"
+                f"⚙️ **Engine Status:** `{p_status}`\n"
+                f"👤 **Account:** `{get_entity_display_name(me, 'Me')}` (`{phone}`)"
+            )
+
+        elif text.startswith(".spintax"):
+            sample = text[len(".spintax"):].strip()
+            if not sample:
+                sample = "{Hello|Hi|Hey} {friend|buddy|mate}! Check out our {amazing|best|top} offer!"
+            result = parse_spintax(sample)
+            await event.respond(
+                f"🎲 **Spintax Live Generator**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📝 **Template:** `{sample}`\n"
+                f"✨ **Output:** `{result}`"
+            )
+
+        elif text.startswith(".analytics"):
+            stats = await asyncio.to_thread(db.get_group_analytics, phone)
+            if not stats:
+                await event.respond("📊 No group analytics data recorded yet.")
+            else:
+                lines = [
+                    "📊 **Target Group Performance Analytics**",
+                    f"👤 **Account:** {config.get('name')} ({phone})",
+                    "━━━━━━━━━━━━━━━━━━"
+                ]
+                total_posts = 0
+                for idx, s in enumerate(stats[:20], 1):
+                    tot = s["success_count"] + s["fail_count"]
+                    total_posts += tot
+                    rate = (s["success_count"] / tot * 100) if tot > 0 else 0
+                    lines.append(f"{idx}. **{s['group_url']}**\n   ✅ {s['success_count']} | ❌ {s['fail_count']} | `{rate:.1f}% success` | Status: `{s['last_status']}`")
+                
+                lines.append("━━━━━━━━━━━━━━━━━━")
+                lines.append(f"📍 **Tracked Groups:** `{len(stats)}` | **Total Post Attempts:** `{total_posts}`")
+                
+                current_chunk = []
+                current_len = 0
+                for line in lines:
+                    if current_len + len(line) + 1 > 4000:
+                        await event.respond("\n".join(current_chunk))
+                        current_chunk = [line]
+                        current_len = len(line)
+                    else:
+                        current_chunk.append(line)
+                        current_len += len(line) + 1
+                if current_chunk:
+                    await event.respond("\n".join(current_chunk))
+
+        elif text.startswith(".blacklist") or text.startswith(".quarantine"):
+            arg = text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else ""
+            links = extract_and_normalize_links(arg)
+            blk_list = list(user_state.get("blacklist") or config.get("blacklist") or [])
+            if not links:
+                if not blk_list:
+                    await event.respond("🛡️ **Group Blacklist / Quarantine is empty.**\nUsage: `.blacklist <link1> <link2>`")
+                else:
+                    lines = [f"🛡️ **Group Blacklist ({len(blk_list)}):**", "━━━━━━━━━━━━━━━━━━"]
+                    for idx, b in enumerate(blk_list, 1):
+                        lines.append(f"{idx}. `{b}`")
+                    await event.respond("\n".join(lines))
+            else:
+                groups_list = _get_config_groups(config)
+                added = []
+                for lk in links:
+                    norm = lk.rstrip('/')
+                    if norm not in blk_list:
+                        blk_list.append(norm)
+                        added.append(norm)
+                    if norm in groups_list:
+                        groups_list.remove(norm)
+                user_state["blacklist"] = blk_list
+                config["blacklist"] = blk_list
+                config["groups"] = groups_list
+                await asyncio.to_thread(db.update_user_config, phone, blacklist=blk_list, groups=groups_list)
+                await event.respond(f"🛡️ **Quarantined {len(added)} group(s)** to Blacklist and removed from target active list.")
+
+        elif text.startswith(".unblacklist") or text.startswith(".unquarantine"):
+            arg = text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else ""
+            links = extract_and_normalize_links(arg)
+            if not links:
+                await event.respond("⚠️ Usage: `.unblacklist <link1> <link2>`")
+            else:
+                blk_list = list(user_state.get("blacklist") or config.get("blacklist") or [])
+                removed = []
+                for lk in links:
+                    norm = lk.rstrip('/')
+                    if norm in blk_list:
+                        blk_list.remove(norm)
+                        removed.append(norm)
+                user_state["blacklist"] = blk_list
+                config["blacklist"] = blk_list
+                await asyncio.to_thread(db.update_user_config, phone, blacklist=blk_list)
+                await event.respond(f"✅ Removed **{len(removed)} group(s)** from Blacklist.")
+
+        elif text.startswith(".export"):
+            groups_list = _get_config_groups(config)
+            if not groups_list:
+                await event.respond("📋 No groups to export.")
+            else:
+                file_content = "\n".join(groups_list)
+                with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt", prefix="groups_export_") as tmp:
+                    tmp.write(file_content)
+                    tmp_path = tmp.name
+                
+                try:
+                    await client.send_file(
+                        event.chat_id,
+                        tmp_path,
+                        caption=f"📁 **Target Groups Exported ({len(groups_list)} groups)**"
+                    )
+                finally:
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+
+        elif text.startswith(".import"):
+            imported_text = ""
+            if event.is_reply:
+                reply_msg = await event.get_reply_message()
+                if reply_msg and reply_msg.media and getattr(reply_msg.media, 'document', None):
+                    file_bytes = await client.download_media(reply_msg, file=bytes)
+                    if file_bytes:
+                        imported_text = file_bytes.decode('utf-8', errors='ignore')
+                elif reply_msg and reply_msg.text:
+                    imported_text = reply_msg.text
+
+            if not imported_text:
+                imported_text = text[len(".import"):].strip()
+
+            links = extract_and_normalize_links(imported_text)
+            if not links:
+                await event.respond("⚠️ Usage: `.import <urls>` or reply `.import` to an attached `.txt` file containing group links.")
+            else:
+                groups_list = _get_config_groups(config)
+                added, skipped = [], []
+                for lk in links:
+                    norm = lk.rstrip('/')
+                    if norm not in groups_list:
+                        groups_list.append(norm)
+                        added.append(norm)
+                    else:
+                        skipped.append(norm)
+                config["groups"] = groups_list
+                await asyncio.to_thread(db.update_user_config, phone, groups=groups_list)
+                await event.respond(f"📥 **Import Session Complete!**\n✅ Added **{len(added)}** new groups.\n⚠️ Skipped **{len(skipped)}** duplicate groups.")
+
+        elif text.startswith(".clean"):
+            progress_msg = await event.respond("🧹 **Auditing and cleaning unreachable groups...**")
+            groups_list = _get_config_groups(config)
+            cleaned, kept = [], []
+            for g in list(groups_list):
+                try:
+                    ent = await resolve_group_entity(client, g, config=config, phone=phone)
+                    if isinstance(ent, str):
+                        cleaned.append(g)
+                        continue
+                    status = await check_write_permission(client, ent)
+                    if status in ("Banned", "Muted", "Not Joined", "Read-Only Channel", "Group Deactivated", "Forbidden Group"):
+                        cleaned.append(g)
+                    else:
+                        kept.append(g)
+                except Exception:
+                    cleaned.append(g)
+
+            for c_group in cleaned:
+                if c_group in groups_list:
+                    groups_list.remove(c_group)
+
+            config["groups"] = groups_list
+            await asyncio.to_thread(db.update_user_config, phone, groups=groups_list)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            await event.respond(f"🧹 **Target Groups Cleaned!**\n━━━━━━━━━━━━━━━━━━\n🗑️ Purged Unusable Groups: **{len(cleaned)}**\n✅ Remaining Active Groups: **{len(kept)}**")
+
         elif text.startswith(".help"):
             await event.respond(
                 "🎁 **TELETHON V5 ELITE ADVANCED MODULE**\n\n"
@@ -1584,20 +1802,26 @@ async def run_user_bot(config):
                 "• `.time <m|h>` — Set cycle interval\n"
                 "• `.delay <sec>` — Set message spacing\n"
                 "• `.mode <copy|forward>` — Switch sending style\n"
+                "• `.pause` | `.resume` — Pause or resume ad automation\n"
                 "\n🛰 **Target Groups Management:**\n"
                 "• `.add <url>` (or `.addgroup`) — Add target group(s)\n"
-                "• `.fetch` — List all joined groups with sequence numbers\n"
-                "• `.addnum <1,3|1-5|all>` — Add groups by sequence number\n"
-                "• `.delgroup <url>` — Remove specific group(s)\n"
-                "• `.delall` (or `.delgroup all`) — Clear all target groups\n"
+                "• `.fetch` — List joined groups with sequence numbers\n"
+                "• `.addnum <1-5|all>` — Add groups by sequence number\n"
+                "• `.delgroup <url>` | `.delall` — Clear target groups\n"
                 "• `.groups` — Show all target groups\n"
-                "• `.join <url>` — Join new groups (bulk support)\n"
-                "• `.check` — Audit send permissions on all groups\n"
-                "\n📊 **System Monitoring & Settings:**\n"
-                "• `.stats` — Display detailed runtime metrics & speed\n"
-                "• `.status` — Display sleek system configuration state\n"
+                "• `.join <url>` — Join new groups in bulk\n"
+                "• `.check` — Audit permissions on all groups\n"
+                "• `.clean` — Purge all banned/forbidden groups automatically\n"
+                "• `.export` | `.import` — Export or import groups via text file\n"
+                "• `.blacklist` | `.unblacklist` — Quarantine management\n"
+                "\n📊 **Analytics & System Monitoring:**\n"
+                "• `.ping` — Check latency and engine health\n"
+                "• `.stats` — Display live runtime metrics & speed\n"
+                "• `.analytics` — View top group delivery success rates\n"
+                "• `.status` — Display sleek system configuration panel\n"
+                "• `.spintax <text>` — Test dynamic spintax template\n"
                 "• `.info` | `.night` — Account details and Auto-Night window\n"
-                "• `.error` — Display recent error/failure logs"
+                "• `.error` — Display recent error/failure tracebacks"
             )
 
     async def forward_loop():
@@ -1607,10 +1831,21 @@ async def run_user_bot(config):
             user_state["wake_event"].clear()
             ad_reload_needed = False
             try:
-                # 🎯 Check if target groups are configured first
+                # ⏸️ Pause Check
+                if user_state.get("is_paused", False) or config.get("is_paused", False):
+                    user_state["status"] = "Paused ⏸️"
+                    now = _get_now_tz(tz)
+                    user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
+                    await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
+                    continue
+
+                # 🎯 Check if target groups are configured first & filter out Blacklisted groups
                 groups_list = _get_config_groups(config)
+                blk_set = {b.rstrip('/') for b in (user_state.get("blacklist") or config.get("blacklist") or [])}
+                groups_list = [g for g in groups_list if g.rstrip('/') not in blk_set]
+
                 if not groups_list:
-                    log_event("No target groups configured.")
+                    log_event("No active target groups configured (or all blacklisted).")
                     user_state["status"] = "Idle (No Groups) 😴"
                     now = _get_now_tz(tz)
                     user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
@@ -1645,12 +1880,19 @@ async def run_user_bot(config):
                     user_state["current_cycle_fail"] = 0
 
                     groups_list = _get_config_groups(config)
+                    blk_set = {b.rstrip('/') for b in (user_state.get("blacklist") or config.get("blacklist") or [])}
+                    groups_list = [g for g in groups_list if g.rstrip('/') not in blk_set]
+
                     for i, group in enumerate(groups_list, 1):
                         if user_state.get("ads_updated", False) or ad_reload_needed:
                             log_event("📢 Ad update detected mid-group loop! Aborting to reload fresh ads immediately...")
                             user_state["ads_updated"] = False
                             user_state["wake_event"].clear()
                             ad_reload_needed = True
+                            break
+
+                        # Check if paused mid-loop
+                        if user_state.get("is_paused", False):
                             break
 
                         # If night starts mid-cycle, break early
@@ -1668,6 +1910,7 @@ async def run_user_bot(config):
                                 log_event(f"Cannot resolve {group}. Skipping group.")
                                 user_state["fail_total"] += 1
                                 user_state["current_cycle_fail"] += 1
+                                await asyncio.to_thread(db.log_group_analytics, phone, group, False, "Cannot Resolve")
                                 continue
 
                             # 🔄 Refresh Saved Messages list real-time so smart keyword matching & deletion checks reflect current state
@@ -1696,11 +1939,10 @@ async def run_user_bot(config):
                             send_msg = next((m for m in fresh_valid if m.id == send_msg.id), send_msg)
 
                             if user_state["use_copy"]:
-                                # 🌈 Copy Mode (with sequential message_id tag & entity formatting)
+                                # 🌈 Copy Mode (with Spintax support & formatting)
                                 user_state["msg_seq"] += 1
-                                seq_num = user_state["msg_seq"]
                                 base_text = (send_msg.text or "").strip()
-                                caption = base_text
+                                caption = parse_spintax(base_text)
 
                                 from telethon.tl.types import MessageMediaWebPage
                                 has_media = send_msg.media and not isinstance(send_msg.media, MessageMediaWebPage)
@@ -1733,6 +1975,7 @@ async def run_user_bot(config):
                             user_state["success_total"] += 1
                             user_state["current_cycle_success"] += 1
                             log_event(f"Msg {msg_idx} Success -> {group}")
+                            await asyncio.to_thread(db.log_group_analytics, phone, group, True, "OK")
 
                         except FloodWaitError as e:
                              log_event(f"FloodWait! Sleeping {e.seconds}s. Increasing delay for account safety.")
@@ -1761,10 +2004,24 @@ async def run_user_bot(config):
                              user_state["next_msg_at"] = now + timedelta(seconds=e.seconds + 2)
                              await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
                              custom_sleep_done = True
+                        except (UserBannedInChannelError, ChatWriteForbiddenError, ChannelPrivateError, ChatAdminRequiredError) as e:
+                             err_name = type(e).__name__
+                             log_event(f"Forbidden in {group} ({err_name}). Auto-quarantining group.")
+                             await asyncio.to_thread(db.log_group_analytics, phone, group, False, err_name)
+                             blk_list = list(user_state.get("blacklist") or config.get("blacklist") or [])
+                             norm_g = group.rstrip('/')
+                             if norm_g not in blk_list:
+                                 blk_list.append(norm_g)
+                                 user_state["blacklist"] = blk_list
+                                 config["blacklist"] = blk_list
+                                 await asyncio.to_thread(db.update_user_config, phone, blacklist=blk_list)
+                             user_state["fail_total"] += 1
+                             user_state["current_cycle_fail"] += 1
                         except Exception as e:
                              import traceback
                              tb_str = traceback.format_exc()
                              log_event(f"Unable to send message to {group} ({type(e).__name__}: {e}). Skipping group.", details=tb_str)
+                             await asyncio.to_thread(db.log_group_analytics, phone, group, False, type(e).__name__)
                              user_state["fail_total"] += 1
                              user_state["current_cycle_fail"] += 1
 
