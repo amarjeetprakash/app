@@ -96,6 +96,15 @@ def parse_spintax(text: str) -> str:
         text = text[:match.start()] + choice + text[match.end():]
     return text
 
+def generate_random_same_number_id() -> str:
+    """
+    Generates a random sequence ID consisting of a repeated same digit (1-9),
+    ranging from 1 to 4 digits in length (e.g. '1', '11', '111', '1111', '7', '77', '777', '7777', '9999').
+    """
+    digit = str(random.randint(1, 9))
+    length = random.randint(1, 4)
+    return digit * length
+
 def get_telethon_proxy(proxy_cfg: Optional[dict]):
     """
     Constructs Telethon-compatible proxy configuration tuple.
@@ -1955,10 +1964,14 @@ async def run_user_bot(config):
                             send_msg = next((m for m in fresh_valid if m.id == send_msg.id), send_msg)
 
                             if user_state["use_copy"]:
-                                # 🌈 Copy Mode (with Spintax support & formatting)
+                                # 🌈 Copy Mode: Append sequence tag with random same digit (1, 11, 111, 1111, 77, 8888) at bottom
                                 user_state["msg_seq"] += 1
                                 base_text = (send_msg.text or "").strip()
-                                caption = parse_spintax(base_text)
+                                seq_id = generate_random_same_number_id()
+                                if base_text:
+                                    caption = f"{base_text}\n\nId - {seq_id}"
+                                else:
+                                    caption = f"Id - {seq_id}"
 
                                 from telethon.tl.types import MessageMediaWebPage
                                 has_media = send_msg.media and not isinstance(send_msg.media, MessageMediaWebPage)
