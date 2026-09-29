@@ -821,13 +821,18 @@ async def run_user_bot(config):
         "start_time": _get_now_tz(reload_autonight_cfg().get("tz", DEFAULT_AUTONIGHT["tz"]))
     }
 
-    async def remove_denied_group(group_url: str):
+    async def auto_remove_group(group_url: str, reason: str = "Banned/Not Joined"):
         groups = _get_config_groups(config)
-        if group_url in groups:
-            groups.remove(group_url)
+        norm_url = str(group_url or "").strip().rstrip('/')
+        removed = False
+        for g in list(groups):
+            if g.strip().rstrip('/') == norm_url or g == group_url:
+                groups.remove(g)
+                removed = True
+        if removed:
             config["groups"] = groups
             await asyncio.to_thread(db.update_user_config, phone, groups=groups)
-            log_event(f"🗑️ Auto-removed access denied group: {group_url}")
+            log_event(f"🗑️ Auto-removed unusable group '{group_url}' ({reason}) from target list.")
 
     active_bots[phone] = {
         "client": None,
@@ -1907,10 +1912,21 @@ async def run_user_bot(config):
                         try:
                             target_entity = await resolve_group_entity(client, group, config=config, phone=phone)
                             if isinstance(target_entity, str):
-                                log_event(f"Cannot resolve {group}. Skipping group.")
+                                log_event(f"Cannot resolve {group}. Auto-removing from target groups.")
                                 user_state["fail_total"] += 1
                                 user_state["current_cycle_fail"] += 1
                                 await asyncio.to_thread(db.log_group_analytics, phone, group, False, "Cannot Resolve")
+                                await auto_remove_group(group, "Cannot Resolve / Access Denied")
+                                continue
+
+                            # 🛡️ Audit write permission prior to sending
+                            perm_status = await check_write_permission(client, target_entity)
+                            if perm_status != "Healthy":
+                                log_event(f"Group {group} is '{perm_status}'. Auto-removing from target groups.")
+                                user_state["fail_total"] += 1
+                                user_state["current_cycle_fail"] += 1
+                                await asyncio.to_thread(db.log_group_analytics, phone, group, False, perm_status)
+                                await auto_remove_group(group, perm_status)
                                 continue
 
                             # 🔄 Refresh Saved Messages list real-time so smart keyword matching & deletion checks reflect current state
@@ -2006,15 +2022,20 @@ async def run_user_bot(config):
                              custom_sleep_done = True
                         except (UserBannedInChannelError, ChatWriteForbiddenError, ChannelPrivateError, ChatAdminRequiredError) as e:
                              err_name = type(e).__name__
-                             log_event(f"Forbidden in {group} ({err_name}). Auto-quarantining group.")
+                             log_event(f"Forbidden in {group} ({err_name}). Auto-removing group from target list.")
                              await asyncio.to_thread(db.log_group_analytics, phone, group, False, err_name)
-                             blk_list = list(user_state.get("blacklist") or config.get("blacklist") or [])
-                             norm_g = group.rstrip('/')
-                             if norm_g not in blk_list:
-                                 blk_list.append(norm_g)
-                                 user_state["blacklist"] = blk_list
-                                 config["blacklist"] = blk_list
-                                 await asyncio.to_thread(db.update_user_config, phone, blacklist=blk_list)
+                             await auto_remove_group(group, err_name)
+                             user_state["fail_total"] += 1
+                             user_state["current_cycle_fail"] += 1
+                        except RPCError as e:
+                             err_str = str(e).lower()
+                             err_name = type(e).__name__
+                             if "not participant" in err_str or "usernotparticipant" in err_str or "banned" in err_str or "forbidden" in err_str or "private" in err_str:
+                                 log_event(f"Group {group} restriction ({err_name}). Auto-removing group from target list.")
+                                 await auto_remove_group(group, err_name)
+                             else:
+                                 log_event(f"RPCError for {group}: {e}")
+                             await asyncio.to_thread(db.log_group_analytics, phone, group, False, err_name)
                              user_state["fail_total"] += 1
                              user_state["current_cycle_fail"] += 1
                         except Exception as e:
