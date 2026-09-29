@@ -465,6 +465,86 @@ async def check_write_permission(client, entity) -> str:
         logger.warning(f"check_write_permission error: {e}")
         return "Healthy"
 
+SYSTEM_MESSAGE_PATTERNS = [
+    r"^\s*[\./]",  # Dot commands (.status, .delay, .help, etc.) or slash commands (/start)
+    r"^\s*⚙️\s*System Status Panel",
+    r"^\s*📊\s*System Statistics",
+    r"^\s*📊\s*Group Health Report",
+    r"^\s*📊\s*Sequence Group Selection",
+    r"^\s*❀\s*User Info:",
+    r"^\s*📋\s*Joined Target Groups",
+    r"^\s*📋\s*All joined groups",
+    r"^\s*📋\s*No groups configured",
+    r"^\s*📋\s*No errors recorded",
+    r"^\s*🎁\s*TELETHON V5 ELITE",
+    r"^\s*❌\s*Recent Error Console",
+    r"^\s*❌\s*Error Detail",
+    r"^\s*🗑️\s*Target groups list",
+    r"^\s*🗑️\s*Error logs cleared",
+    r"^\s*🧠\s*Smart Ad Sender",
+    r"^\s*🕒\s*Auto-Night window",
+    r"^\s*🌙\s*Auto-Night Mode:",
+    r"^\s*🛡️\s*Minimum safe",
+    r"^\s*🛡️\s*Safe message delay",
+    r"^\s*🛡️\s*Errors detected",
+    r"^\s*⏳\s*Fetching unadded",
+    r"^\s*⏳\s*Preparing to join",
+    r"^\s*🔍\s*Auditing permissions",
+    r"^\s*✅\s*Cycle delay set",
+    r"^\s*✅\s*Safe message delay",
+    r"^\s*✅\s*Auto-Night enabled",
+    r"^\s*✅\s*Added",
+    r"^\s*✅\s*Removed",
+    r"^\s*✅\s*Mode set",
+    r"^\s*🚫\s*Auto-Night disabled",
+    r"^\s*⚠️\s*Minimum",
+    r"^\s*⚠️\s*Usage:",
+    r"^\s*⚠️\s*Format:",
+    r"^\s*⚠️\s*No valid",
+    r"^\s*⚠️\s*Invalid",
+    r"^\s*⚠️\s*No fetched",
+    r"^\s*❗\s*Usage:",
+    r"^\s*❗\s*Format:",
+]
+
+def is_valid_user_ad(msg: Any) -> bool:
+    """
+    Checks if a message from Saved Messages ('me') is a genuine user ad message,
+    strictly excluding bot commands (.status, .delay, etc.) and system status responses.
+    """
+    if not msg:
+        return False
+        
+    text = (getattr(msg, 'text', '') or "").strip()
+    
+    from telethon.tl.types import MessageMediaWebPage
+    media = getattr(msg, 'media', None)
+    has_media = media and not isinstance(media, MessageMediaWebPage)
+    
+    if not text and not has_media:
+        return False
+        
+    if text:
+        for pattern in SYSTEM_MESSAGE_PATTERNS:
+            if re.search(pattern, text, re.IGNORECASE):
+                return False
+
+    return True
+
+async def get_active_ad_messages(client: Any) -> List[Any]:
+    """
+    Fetches raw messages from Saved Messages ('me') and filters out any deleted,
+    empty, bot command, or system response messages, returning only valid active user ads.
+    """
+    try:
+        messages = await client.get_messages("me", limit=100)
+        valid_ads = [m for m in messages if is_valid_user_ad(m)]
+        valid_ads.reverse() # Send in chronological order (oldest to newest)
+        return valid_ads
+    except Exception as e:
+        logger.error(f"Error fetching active ad messages: {e}")
+        return []
+
 STOP_WORDS = {
     "the", "and", "for", "with", "this", "that", "from", "group", "chat", "official",
     "link", "https", "http", "telegram", "tme", "channel", "join", "admin", "owner",
@@ -860,8 +940,7 @@ async def run_user_bot(config):
     async def out_ad_handler(event):
         if not event.message:
             return
-        text = (event.raw_text or "").strip()
-        if text.startswith("."):
+        if not is_valid_user_ad(event.message):
             return
         chat = await event.get_chat()
         is_saved = getattr(chat, 'is_self', False)
@@ -898,8 +977,7 @@ async def run_user_bot(config):
     async def edited_ad_handler(event):
         if not event.message:
             return
-        text = (event.raw_text or "").strip()
-        if text.startswith("."):
+        if not is_valid_user_ad(event.message):
             return
         chat = await event.get_chat()
         is_saved = getattr(chat, 'is_self', False)
@@ -1539,17 +1617,13 @@ async def run_user_bot(config):
                     await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
                     continue
 
-                # 💎 Fetch all messages from Saved Messages (up to 100)
+                # 💎 Fetch active user ad messages from Saved Messages (up to 100)
                 user_state["status"] = "Fetching Msgs 🔍"
-                messages = await client.get_messages("me", limit=100)
-                
-                # Filter out messages that cannot be sent (empty text & no media)
-                valid_messages = [m for m in messages if m.text or m.media]
-                valid_messages.reverse()
+                valid_messages = await get_active_ad_messages(client)
 
                 if not valid_messages:
-                    log_event("No valid messages in Saved Messages.")
-                    user_state["status"] = "Idle (No Msg) 😴"
+                    log_event("No valid user ad messages in Saved Messages.")
+                    user_state["status"] = "Idle (No Ads) 😴"
                     now = _get_now_tz(tz)
                     user_state["next_msg_at"] = now + timedelta(minutes=user_state["cycle"])
                     await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
@@ -1596,37 +1670,30 @@ async def run_user_bot(config):
                                 user_state["current_cycle_fail"] += 1
                                 continue
 
-                            # 🔄 Refresh Saved Messages list so smart keyword matching reflects newly edited text
-                            try:
-                                fresh_saved = await client.get_messages("me", limit=100)
-                                fresh_valid = [m for m in fresh_saved if m.text or m.media]
-                                if fresh_valid:
-                                    fresh_valid.reverse()
-                                    valid_messages = fresh_valid
-                            except Exception:
-                                pass
+                            # 🔄 Refresh Saved Messages list real-time so smart keyword matching & deletion checks reflect current state
+                            fresh_valid = await get_active_ad_messages(client)
+                            if not fresh_valid:
+                                log_event("⚠️ All ads deleted or removed from Saved Messages. Skipping ad loop.")
+                                ad_reload_needed = True
+                                break
+
+                            valid_ids = {m.id for m in fresh_valid}
 
                             # 🎯 Smart Ad Sender: Select message matching group topic tags, or fall back to default flow
                             send_msg = msg
                             if user_state.get("smart_ad_mode", True):
-                                matched_msg = find_smart_matched_message(group, target_entity, valid_messages)
+                                matched_msg = find_smart_matched_message(group, target_entity, fresh_valid)
                                 if matched_msg:
                                     send_msg = matched_msg
                                     log_event(f"🎯 Smart Ad Tag Match for {group}")
 
-                            # 🔄 Live Saved Message Fetch: Ensure message still exists in Saved Messages & fetch updated text
-                            try:
-                                live_msg = await client.get_messages("me", ids=send_msg.id)
-                                if isinstance(live_msg, list):
-                                    live_msg = live_msg[0] if live_msg else None
-                                if live_msg and not getattr(live_msg, 'empty', False) and (live_msg.text or live_msg.media):
-                                    send_msg = live_msg
-                                else:
-                                    log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or empty. Skipping deleted ad.")
-                                    continue
-                            except Exception as live_err:
-                                log_event(f"⚠️ Saved Message #{send_msg.id} is deleted/invalid ({live_err}). Skipping deleted ad.")
+                            # 🔄 Live Saved Message Verification: Ensure send_msg is STILL active in Saved Messages
+                            if send_msg.id not in valid_ids:
+                                log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or removed from Saved Messages. Skipping deleted ad.")
                                 continue
+
+                            # Use latest version of send_msg from fresh_valid (reflecting any real-time text edits)
+                            send_msg = next((m for m in fresh_valid if m.id == send_msg.id), send_msg)
 
                             if user_state["use_copy"]:
                                 # 🌈 Copy Mode (with sequential message_id tag & entity formatting)
