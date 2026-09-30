@@ -585,9 +585,9 @@ SYSTEM_MESSAGE_PATTERNS = [
 def is_valid_user_ad(msg: Any) -> bool:
     """
     Checks if a message from Saved Messages ('me') is a genuine user ad message,
-    strictly excluding bot commands (.status, .delay, etc.) and system status responses.
+    strictly excluding bot commands (.status, .delay, etc.), service messages, and deleted messages.
     """
-    if not msg:
+    if not msg or getattr(msg, 'empty', False) or getattr(msg, 'action', None) is not None:
         return False
         
     text = (getattr(msg, 'text', '') or "").strip()
@@ -2012,8 +2012,9 @@ async def run_user_bot(config):
 
                             # 🔄 Live Saved Message Verification: Ensure send_msg is STILL active in Saved Messages
                             if send_msg.id not in valid_ids:
-                                log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or removed from Saved Messages. Skipping deleted ad.")
-                                continue
+                                log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or removed from Saved Messages. Reloading ad queue immediately...")
+                                ad_reload_needed = True
+                                break
 
                             # Use latest version of send_msg from fresh_valid (reflecting any real-time text edits)
                             send_msg = next((m for m in fresh_valid if m.id == send_msg.id), send_msg)
@@ -2260,9 +2261,19 @@ async def auto_restart_watchdog():
                     pass
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
+async def auto_24h_cleanup_task():
+    while True:
+        try:
+            await asyncio.to_thread(db.purge_old_logs_and_analytics, 24.0)
+            logger.info("Executed 24-hour automated database log and analytics cleanup.")
+        except Exception as e:
+            logger.error(f"Error in 24h cleanup task: {e}")
+        await asyncio.sleep(3600) # Check every 1 hour
+
 async def main():
     os.makedirs(SESSIONS_DIR, exist_ok=True)
     asyncio.create_task(auto_restart_watchdog())
+    asyncio.create_task(auto_24h_cleanup_task())
     
     # Write PID file
     pid_file = PID_FILE

@@ -81,6 +81,12 @@ def init_db():
             cursor.execute("ALTER TABLE users ADD COLUMN blacklist TEXT DEFAULT '[]';")
         if "is_paused" not in cols:
             cursor.execute("ALTER TABLE users ADD COLUMN is_paused INTEGER DEFAULT 0;")
+
+        # Migration: Ensure created_at column exists on errors table for 24h retention purging
+        cursor.execute("PRAGMA table_info(errors);")
+        err_cols = [c[1] for c in cursor.fetchall()]
+        if "created_at" not in err_cols:
+            cursor.execute("ALTER TABLE errors ADD COLUMN created_at REAL DEFAULT 0.0;")
         
         conn.commit()
     finally:
@@ -547,9 +553,10 @@ def log_error(phone: str, timestamp: str, message: str, details: Optional[str] =
     conn = get_db()
     try:
         cursor = conn.cursor()
+        now_ts = time.time()
         cursor.execute(
-            "INSERT INTO errors (phone, timestamp, message, details) VALUES (?, ?, ?, ?)",
-            (phone, timestamp, message, details)
+            "INSERT INTO errors (phone, timestamp, message, details, created_at) VALUES (?, ?, ?, ?, ?)",
+            (phone, timestamp, message, details, now_ts)
         )
         cursor.execute(
             """
@@ -594,6 +601,28 @@ def clear_errors(phone: str):
         cursor = conn.cursor()
         cursor.execute("DELETE FROM errors WHERE phone = ?", (phone,))
         conn.commit()
+    finally:
+        conn.close()
+
+def purge_old_logs_and_analytics(hours: float = 24.0):
+    """
+    Purges error logs and analytics entries older than `hours` (default 24 hours)
+    from the SQLite database app_data.db.
+    """
+    conn = get_db()
+    try:
+        cursor = conn.cursor()
+        cutoff_ts = time.time() - (hours * 3600.0)
+        
+        # 1. Clear analytics entries older than cutoff
+        cursor.execute("DELETE FROM analytics WHERE last_sent_at > 0 AND last_sent_at < ?", (cutoff_ts,))
+        
+        # 2. Clear errors older than cutoff
+        cursor.execute("DELETE FROM errors WHERE created_at > 0 AND created_at < ?", (cutoff_ts,))
+        
+        conn.commit()
+    except Exception as e:
+        print(f"[!] Database 24h cleanup error: {e}")
     finally:
         conn.close()
 
