@@ -137,13 +137,11 @@ def is_runner_running() -> bool:
 
     if os.name == 'nt':
         try:
-            import ctypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
+            cmd = f'tasklist /FI "PID eq {pid}" /FO CSV /NH'
+            res = subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.DEVNULL)
+            if "python" in res.lower():
                 return True
-            err = ctypes.windll.kernel32.GetLastError()
-            return err == 5
+            return False
         except Exception:
             return False
     else:
@@ -163,7 +161,7 @@ def stop_runner():
         except Exception:
             pass
 
-    if pid:
+    if pid and is_runner_running():
         print(Fore.YELLOW + f"  [🔁] Stopping background engine (PID: {pid})...")
         try:
             if os.name == 'nt':
@@ -171,7 +169,6 @@ def stop_runner():
             else:
                 import signal
                 os.kill(pid, signal.SIGTERM)
-                # Wait up to 3 seconds for the process to exit gracefully
                 for _ in range(30):
                     import time as pytime
                     pytime.sleep(0.1)
@@ -180,7 +177,6 @@ def stop_runner():
                     except OSError:
                         break
                 else:
-                    # Force kill if still alive
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except OSError:
@@ -192,7 +188,8 @@ def stop_runner():
     print(Fore.YELLOW + "  [🔁] Cleaning up any remaining runner processes...")
     try:
         if os.name == 'nt':
-            subprocess.run('wmic process where "CommandLine like \'%runner.py%\'" call terminate', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ps_cmd = "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*runner.py*' } | Remove-CimInstance\""
+            subprocess.run(ps_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             subprocess.run("pkill -9 -f runner.py", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:

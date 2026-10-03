@@ -529,8 +529,16 @@ async def check_write_permission(client, entity) -> str:
         logger.warning(f"check_write_permission error: {e}")
         return "Healthy"
 
+BOT_COMMAND_NAMES = (
+    ".time", ".delay", ".status", ".stats", ".info", ".fetch", ".addnum", ".select",
+    ".addgroup", ".add", ".delall", ".delgroup", ".groups", ".night", ".mode",
+    ".join", ".check", ".smart", ".errors", ".error", ".pause", ".resume", ".ping",
+    ".spintax", ".analytics", ".blacklist", ".quarantine", ".unblacklist", ".unquarantine",
+    ".export", ".import", ".clean", ".help", ".restart", ".show", ".ads", ".showads",
+    ".del", ".delad", "/start", "/help"
+)
+
 SYSTEM_MESSAGE_PATTERNS = [
-    r"^\s*[\./]",  # Dot commands (.status, .delay, .help, etc.) or slash commands (/start)
     r"^\s*⚙️\s*System Status Panel",
     r"^\s*📊\s*System Statistics",
     r"^\s*📊\s*Group Health Report",
@@ -541,11 +549,13 @@ SYSTEM_MESSAGE_PATTERNS = [
     r"^\s*📋\s*All joined groups",
     r"^\s*📋\s*No groups configured",
     r"^\s*📋\s*No errors recorded",
+    r"^\s*📋\s*Active Ad Messages",
     r"^\s*🎁\s*TELETHON V5 ELITE",
     r"^\s*❌\s*Recent Error Console",
     r"^\s*❌\s*Error Detail",
     r"^\s*🗑️\s*Target groups list",
     r"^\s*🗑️\s*Error logs cleared",
+    r"^\s*🗑️\s*Ad Message",
     r"^\s*🧠\s*Smart Ad Sender",
     r"^\s*🕒\s*Auto-Night window",
     r"^\s*🌙\s*Auto-Night Mode:",
@@ -557,6 +567,7 @@ SYSTEM_MESSAGE_PATTERNS = [
     r"^\s*⏳\s*Fetching unadded",
     r"^\s*⏳\s*Preparing to join",
     r"^\s*🔍\s*Auditing permissions",
+    r"^\s*🔍\s*Fetching active ad messages",
     r"^\s*✅\s*Cycle delay set",
     r"^\s*✅\s*Safe message delay",
     r"^\s*✅\s*Auto-Night enabled",
@@ -570,10 +581,12 @@ SYSTEM_MESSAGE_PATTERNS = [
     r"^\s*⚠️\s*No valid",
     r"^\s*⚠️\s*Invalid",
     r"^\s*⚠️\s*No fetched",
+    r"^\s*⚠️\s*Ad message with ID",
     r"^\s*❗\s*Usage:",
     r"^\s*❗\s*Format:",
     r"^\s*⏸️\s*Engine Paused",
     r"^\s*▶️\s*Engine Resumed",
+    r"^\s*🔄\s*Restarting",
     r"^\s*🏓\s*Pong",
     r"^\s*🎲\s*Spintax Live Generator",
     r"^\s*📁\s*Target Groups Exported",
@@ -600,6 +613,11 @@ def is_valid_user_ad(msg: Any) -> bool:
         return False
         
     if text:
+        tokens = text.split()
+        first_token = tokens[0].lower() if tokens else ""
+        if any(first_token == cmd or first_token.startswith(cmd + " ") for cmd in BOT_COMMAND_NAMES):
+            return False
+
         for pattern in SYSTEM_MESSAGE_PATTERNS:
             if re.search(pattern, text, re.IGNORECASE):
                 return False
@@ -612,7 +630,7 @@ async def get_active_ad_messages(client: Any) -> List[Any]:
     empty, bot command, or system response messages, returning only valid active user ads.
     """
     try:
-        messages = await client.get_messages("me", limit=100)
+        messages = await client.get_messages("me", limit=300)
         valid_ads = [m for m in messages if is_valid_user_ad(m)]
         valid_ads.reverse() # Send in chronological order (oldest to newest)
         return valid_ads
@@ -1864,6 +1882,106 @@ async def run_user_bot(config):
                 pass
             await event.respond(f"🧹 **Target Groups Cleaned!**\n━━━━━━━━━━━━━━━━━━\n🗑️ Purged Unusable Groups: **{len(cleaned)}**\n✅ Remaining Active Groups: **{len(kept)}**")
 
+        elif text.startswith(".restart"):
+            await event.respond("🔄 **Restarting bot engine process...**")
+            await asyncio.sleep(1)
+            asyncio.create_task(perform_restart())
+
+        elif text.startswith(".show") or text == ".ads" or text.startswith(".ads ") or text.startswith(".showads"):
+            progress_msg = await event.respond("🔍 **Fetching active ad messages from Saved Messages...**")
+            try:
+                valid_ads = await get_active_ad_messages(client)
+                if not valid_ads:
+                    await progress_msg.edit("📋 **No active ad messages found in Saved Messages.**\n💡 Send an ad message to your **Saved Messages** to set it as an ad!")
+                    return
+
+                lines = [
+                    f"📢 **Active Ad Messages in Saved Messages ({len(valid_ads)})**",
+                    "━━━━━━━━━━━━━━━━━━"
+                ]
+                for idx, m in enumerate(valid_ads, 1):
+                    m_id = m.id
+                    raw_t = (m.text or "").strip()
+                    preview = (raw_t[:60] + "...") if len(raw_t) > 60 else (raw_t or "[Media Content]")
+                    preview_clean = preview.replace("\n", " ")
+                    
+                    from telethon.tl.types import MessageMediaWebPage
+                    media_type = ""
+                    if m.media and not isinstance(m.media, MessageMediaWebPage):
+                        if getattr(m, 'photo', None):
+                            media_type = " 📷 [Photo]"
+                        elif getattr(m, 'video', None):
+                            media_type = " 🎥 [Video]"
+                        elif getattr(m, 'document', None):
+                            media_type = " 📁 [Document]"
+                        else:
+                            media_type = " 📎 [Media]"
+
+                    lines.append(f"{idx}. 🆔 `[ID: {m_id}]`{media_type}\n   📝 {preview_clean}")
+
+                lines.append("━━━━━━━━━━━━━━━━━━")
+                lines.append("💡 **To delete an ad:** Type `.del <ID>` (e.g. `.del 12345`) or `.del <num>` (e.g. `.del 1`)")
+
+                try:
+                    await progress_msg.delete()
+                except Exception:
+                    pass
+
+                current_chunk = []
+                current_len = 0
+                for line in lines:
+                    if current_len + len(line) + 1 > 4000:
+                        await event.respond("\n".join(current_chunk))
+                        current_chunk = [line]
+                        current_len = len(line)
+                    else:
+                        current_chunk.append(line)
+                        current_len += len(line) + 1
+                if current_chunk:
+                    await event.respond("\n".join(current_chunk))
+
+            except Exception as e:
+                logger.error(f"Error in show ads command: {e}", exc_info=True)
+                await progress_msg.edit(f"❌ Failed to fetch ads: {type(e).__name__} - {e}")
+
+        elif text.startswith(".delad") or (text.startswith(".del") and not text.startswith(".delgroup") and not text.startswith(".delall")):
+            arg = text[len(".delad"):].strip() if text.startswith(".delad") else text[len(".del"):].strip()
+            if not arg:
+                await event.respond("⚠️ Usage: `.del <message_id>` or `.del <num>`\n💡 Run `.show` or `.ads` first to view ad IDs.")
+                return
+
+            valid_ads = await get_active_ad_messages(client)
+            if not valid_ads:
+                await event.respond("📋 No active ad messages found in Saved Messages.")
+                return
+
+            target_msg_id = None
+            if arg.isdigit():
+                num_val = int(arg)
+                if 1 <= num_val <= len(valid_ads):
+                    target_msg_id = valid_ads[num_val - 1].id
+                else:
+                    match_id = next((m.id for m in valid_ads if str(m.id) == arg), None)
+                    if match_id:
+                        target_msg_id = match_id
+            else:
+                match_id = next((m.id for m in valid_ads if str(m.id) == arg), None)
+                if match_id:
+                    target_msg_id = match_id
+
+            if not target_msg_id:
+                await event.respond(f"⚠️ Ad message with ID or Sequence `{arg}` not found.\n💡 Run `.show` or `.ads` to check active ad IDs.")
+                return
+
+            try:
+                await client.delete_messages("me", [target_msg_id])
+                user_state["ads_updated"] = True
+                user_state["wake_event"].set()
+                await event.respond(f"🗑️ **Ad Message `[ID: {target_msg_id}]` deleted successfully from Saved Messages!**")
+            except Exception as e:
+                logger.error(f"Error deleting ad message {target_msg_id}: {e}", exc_info=True)
+                await event.respond(f"❌ Failed to delete message `[ID: {target_msg_id}]`: {type(e).__name__} - {e}")
+
         elif text.startswith(".help"):
             await event.respond(
                 "🎁 **TELETHON V5 ELITE ADVANCED MODULE**\n\n"
@@ -1872,6 +1990,10 @@ async def run_user_bot(config):
                 "• `.delay <sec>` — Set message spacing\n"
                 "• `.mode <copy|forward>` — Switch sending style\n"
                 "• `.pause` | `.resume` — Pause or resume ad automation\n"
+                "• `.restart` — Restart process engine\n"
+                "\n📢 **Ad Messages Management:**\n"
+                "• `.show` | `.ads` — View all active ad messages with IDs\n"
+                "• `.del <id|num>` — Delete ad message by ID or sequence number\n"
                 "\n🛰 **Target Groups Management:**\n"
                 "• `.add <url>` (or `.addgroup`) — Add target group(s)\n"
                 "• `.fetch` — List joined groups with sequence numbers\n"
@@ -1993,30 +2115,26 @@ async def run_user_bot(config):
                                 await auto_remove_group(group, perm_status)
                                 continue
 
-                            # 🔄 Refresh Saved Messages list real-time so smart keyword matching & deletion checks reflect current state
-                            fresh_valid = await get_active_ad_messages(client)
+                            fresh_valid = valid_messages
                             if not fresh_valid:
-                                log_event("⚠️ All ads deleted or removed from Saved Messages. Skipping ad loop.")
+                                log_event("⚠️ No valid ads available in Saved Messages.")
                                 ad_reload_needed = True
                                 break
 
                             valid_ids = {m.id for m in fresh_valid}
 
-                            # 🎯 Smart Ad Sender: Select message matching group topic tags, or fall back to default flow
+                            # 🎯 Smart Ad Sender: Select message matching group topic tags if smart mode is explicitly enabled
                             send_msg = msg
-                            if user_state.get("smart_ad_mode", True):
+                            if user_state.get("smart_ad_mode", False):
                                 matched_msg = find_smart_matched_message(group, target_entity, fresh_valid)
                                 if matched_msg:
                                     send_msg = matched_msg
                                     log_event(f"🎯 Smart Ad Tag Match for {group}")
 
-                            # 🔄 Live Saved Message Verification: Ensure send_msg is STILL active in Saved Messages
+                            # 🔄 Saved Message Verification: Ensure send_msg is active
                             if send_msg.id not in valid_ids:
-                                log_event(f"⚠️ Saved Message #{send_msg.id} was deleted or removed from Saved Messages. Reloading ad queue immediately...")
-                                ad_reload_needed = True
-                                break
+                                send_msg = valid_messages[0] if valid_messages else msg
 
-                            # Use latest version of send_msg from fresh_valid (reflecting any real-time text edits)
                             send_msg = next((m for m in fresh_valid if m.id == send_msg.id), send_msg)
 
                             if user_state["use_copy"]:
@@ -2155,14 +2273,14 @@ async def run_user_bot(config):
 
                     log_event(f"Msg {msg_idx} cycle complete. Success: {user_state['current_cycle_success']}, Fail: {user_state['current_cycle_fail']}")
                     
-                    # Interval delay between different messages (with organic Timing Jitter)
+                    # Interval delay between different messages in the batch (safe spacing)
                     if msg_idx < len(valid_messages):
                         if autonight_is_slow_mode(AUTONIGHT_CFG):
                             user_state["status"] = "Waiting 🌙 (Night Slow Mode)"
-                            sleep_seconds = random.randint(900, 1200) # 15-20 minutes overnight
+                            sleep_seconds = random.randint(120, 240) # 2-4 minutes overnight
                         else:
-                            user_state["status"] = f"Waiting for next msg ⏳"
-                            sleep_seconds = _get_cycle_seconds_with_jitter(user_state["cycle"])
+                            user_state["status"] = f"Next Ad in {user_state['delay']}s ⏳"
+                            sleep_seconds = max(user_state["delay"], 20)
                         now = _get_now_tz(tz)
                         user_state["next_msg_at"] = now + timedelta(seconds=sleep_seconds)
                         await interruptible_sleep(lambda: user_state["next_msg_at"], tz, wake_event=user_state["wake_event"])
@@ -2217,6 +2335,34 @@ async def run_user_bot(config):
             started_phones.remove(phone)
         log_event(f"Bot for {phone} stopped.")
 
+async def perform_restart():
+    """
+    Gracefully disconnects active client connections, cleans up PID file,
+    and restarts the runner process.
+    """
+    logger.info("Executing graceful process restart...")
+    for p, b_info in list(active_bots.items()):
+        cl = b_info.get("client")
+        if cl:
+            try:
+                await cl.disconnect()
+            except Exception:
+                pass
+    active_bots.clear()
+    started_phones.clear()
+
+    if os.path.exists(PID_FILE):
+        try:
+            os.remove(PID_FILE)
+        except Exception:
+            pass
+
+    await asyncio.sleep(0.5)
+
+    exec_path = sys.executable
+    script_path = os.path.abspath(sys.argv[0])
+    os.execv(exec_path, [exec_path, script_path] + sys.argv[1:])
+
 async def user_loader():
     config_mtimes = {} # phone -> last_updated_at
     while True:
@@ -2227,19 +2373,21 @@ async def user_loader():
                 updated_at = config.get("updated_at", 0.0)
                 if not phone:
                     continue
-                # Only load if new or modified
-                if phone not in config_mtimes or updated_at > config_mtimes[phone]:
-                    if phone not in started_phones:
-                        asyncio.create_task(run_user_bot(config))
-                    else:
-                        # Update active bot in place
-                        if phone in active_bots:
-                            bot = active_bots[phone]
-                            bot["config"].update(config)
-                            # Sync state values
-                            state = bot["state"]
-                            state["delay"] = config.get("msg_delay_sec", 20)
-                            state["cycle"] = config.get("cycle_delay_min", 7)
+                
+                is_paused = config.get("is_paused", False)
+                if is_paused:
+                    continue
+
+                if phone not in started_phones:
+                    asyncio.create_task(run_user_bot(config))
+                    config_mtimes[phone] = updated_at
+                elif updated_at > config_mtimes.get(phone, 0.0):
+                    if phone in active_bots:
+                        bot = active_bots[phone]
+                        bot["config"].update(config)
+                        state = bot["state"]
+                        state["delay"] = config.get("msg_delay_sec", 20)
+                        state["cycle"] = config.get("cycle_delay_min", 7)
                     config_mtimes[phone] = updated_at
         except Exception as e:
             logger.error(f"Error loading user configs from database: {e}")
@@ -2254,12 +2402,7 @@ async def auto_restart_watchdog():
         if elapsed >= max_uptime:
             logger.info("30-hour process uptime reached. Auto-restarting runner process...")
             print(Fore.YELLOW + "\n[🔁] 30-hour process uptime reached. Auto-restarting engine...")
-            if os.path.exists(PID_FILE):
-                try:
-                    os.remove(PID_FILE)
-                except Exception:
-                    pass
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            await perform_restart()
 
 async def auto_24h_cleanup_task():
     while True:
@@ -2309,12 +2452,26 @@ async def main():
             pass
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Shutdown requested. Exiting.")
+    while True:
         try:
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)
-        except Exception:
-            pass
+            asyncio.run(main())
+            break
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Shutdown requested. Exiting.")
+            try:
+                if os.path.exists(PID_FILE):
+                    os.remove(PID_FILE)
+            except Exception:
+                pass
+            break
+        except Exception as e:
+            import traceback
+            tb_str = traceback.format_exc()
+            logger.error(f"Fatal error in main runner process: {e}", exc_info=True)
+            print(Fore.RED + f"\n[!] Engine process crashed: {e}. Auto-restarting in 5 seconds...\n{tb_str}")
+            try:
+                if os.path.exists(PID_FILE):
+                    os.remove(PID_FILE)
+            except Exception:
+                pass
+            time_mod.sleep(5)
